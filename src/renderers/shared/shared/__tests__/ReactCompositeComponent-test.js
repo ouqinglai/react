@@ -427,6 +427,7 @@ describe('ReactCompositeComponent', () => {
         return <div />;
       }
     }
+    Component.childContextTypes = {};
 
     expectDev(console.error.calls.count()).toBe(0);
     var instance = ReactDOM.render(<Component />, container);
@@ -1044,7 +1045,9 @@ describe('ReactCompositeComponent', () => {
 
       componentWillReceiveProps(props) {
         expect(props.update).toBe(1);
+        expect(renders).toBe(1);
         this.setState({updated: true});
+        expect(renders).toBe(1);
       }
 
       render() {
@@ -1058,6 +1061,36 @@ describe('ReactCompositeComponent', () => {
     expect(renders).toBe(1);
     expect(instance.state.updated).toBe(false);
     ReactDOM.render(<Component update={1} />, container);
+    expect(renders).toBe(2);
+    expect(instance.state.updated).toBe(true);
+  });
+
+  it('only renders once if updated in componentWillReceiveProps when batching', () => {
+    var renders = 0;
+
+    class Component extends React.Component {
+      state = {updated: false};
+
+      componentWillReceiveProps(props) {
+        expect(props.update).toBe(1);
+        expect(renders).toBe(1);
+        this.setState({updated: true});
+        expect(renders).toBe(1);
+      }
+
+      render() {
+        renders++;
+        return <div />;
+      }
+    }
+
+    var container = document.createElement('div');
+    var instance = ReactDOM.render(<Component update={0} />, container);
+    expect(renders).toBe(1);
+    expect(instance.state.updated).toBe(false);
+    ReactDOM.unstable_batchedUpdates(() => {
+      ReactDOM.render(<Component update={1} />, container);
+    });
     expect(renders).toBe(2);
     expect(instance.state.updated).toBe(true);
   });
@@ -1323,6 +1356,47 @@ describe('ReactCompositeComponent', () => {
       ReactDOM.render(<App ref={setRef} stage={2} />, container);
     }).toThrow();
     expect(count).toBe(1);
+  });
+
+  it('prepares new child before unmounting old', () => {
+    var log = [];
+
+    class Spy extends React.Component {
+      componentWillMount() {
+        log.push(this.props.name + ' componentWillMount');
+      }
+      render() {
+        log.push(this.props.name + ' render');
+        return <div />;
+      }
+      componentDidMount() {
+        log.push(this.props.name + ' componentDidMount');
+      }
+      componentWillUnmount() {
+        log.push(this.props.name + ' componentWillUnmount');
+      }
+    }
+
+    class Wrapper extends React.Component {
+      render() {
+        return <Spy key={this.props.name} name={this.props.name} />;
+      }
+    }
+
+    var container = document.createElement('div');
+    ReactDOM.render(<Wrapper name="A" />, container);
+    ReactDOM.render(<Wrapper name="B" />, container);
+
+    expect(log).toEqual([
+      'A componentWillMount',
+      'A render',
+      'A componentDidMount',
+
+      'B componentWillMount',
+      'B render',
+      'A componentWillUnmount',
+      'B componentDidMount',
+    ]);
   });
 
 });

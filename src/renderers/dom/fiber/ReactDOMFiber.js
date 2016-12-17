@@ -13,15 +13,17 @@
 'use strict';
 
 import type { Fiber } from 'ReactFiber';
-import type { HostChildren } from 'ReactFiberReconciler';
 import type { ReactNodeList } from 'ReactTypes';
 
+var ReactBrowserEventEmitter = require('ReactBrowserEventEmitter');
 var ReactControlledComponent = require('ReactControlledComponent');
 var ReactDOMComponentTree = require('ReactDOMComponentTree');
 var ReactDOMFeatureFlags = require('ReactDOMFeatureFlags');
 var ReactDOMFiberComponent = require('ReactDOMFiberComponent');
 var ReactDOMInjection = require('ReactDOMInjection');
+var ReactGenericBatching = require('ReactGenericBatching');
 var ReactFiberReconciler = require('ReactFiberReconciler');
+var ReactInputSelection = require('ReactInputSelection');
 var ReactInstanceMap = require('ReactInstanceMap');
 var ReactPortal = require('ReactPortal');
 
@@ -29,17 +31,20 @@ var findDOMNode = require('findDOMNode');
 var invariant = require('invariant');
 var warning = require('warning');
 
-ReactDOMInjection.inject();
-ReactControlledComponent.injection.injectFiberControlledHostComponent(
-  ReactDOMFiberComponent
-);
-
 var {
   createElement,
+  getChildNamespace,
   setInitialProperties,
   updateProperties,
 } = ReactDOMFiberComponent;
 var { precacheFiberNode } = ReactDOMComponentTree;
+
+if (__DEV__) {
+  var validateDOMNesting = require('validateDOMNesting');
+  var { updatedAncestorInfo } = validateDOMNesting;
+}
+
+const DOCUMENT_NODE = 9;
 
 ReactDOMInjection.inject();
 ReactControlledComponent.injection.injectFiberControlledHostComponent(
@@ -52,73 +57,161 @@ findDOMNode._injectFiber(function(fiber: Fiber) {
 type DOMContainerElement = Element & { _reactRootContainer: ?Object };
 
 type Container = Element;
-type Props = { className ?: string };
+type Props = { children ?: mixed };
 type Instance = Element;
 type TextInstance = Text;
 
-function recursivelyAppendChildren(parent : Element, child : HostChildren<Instance | TextInstance>) {
-  if (!child) {
-    return;
-  }
-  /* $FlowFixMe: Element and Text should have this property. */
-  if (child.nodeType === 1 || child.nodeType === 3) {
-    /* $FlowFixMe: Refinement issue. I don't know how to express different. */
-    parent.appendChild(child);
-  } else {
-    /* As a result of the refinement issue this type isn't known. */
-    let node : any = child;
-    do {
-      recursivelyAppendChildren(parent, node.output);
-    } while (node = node.sibling);
-  }
-}
+type HostContextDev = {
+  namespace : string,
+  ancestorInfo : mixed,
+};
+type HostContextProd = string;
+type HostContext = HostContextDev | HostContextProd;
+
+let eventsEnabled : ?boolean = null;
+let selectionInformation : ?mixed = null;
 
 var DOMRenderer = ReactFiberReconciler({
 
-  updateContainer(container : Container, children : HostChildren<Instance | TextInstance>) : void {
-    // TODO: Containers should update similarly to other parents.
-    container.innerHTML = '';
-    recursivelyAppendChildren(container, children);
+  getRootHostContext(rootContainerInstance : Container) : HostContext {
+    const type = rootContainerInstance.tagName.toLowerCase();
+    if (__DEV__) {
+      const namespace = getChildNamespace(null, type);
+      const isMountingIntoDocument = rootContainerInstance.ownerDocument.documentElement === rootContainerInstance;
+      const ancestorInfo = updatedAncestorInfo(null, isMountingIntoDocument ? '#document' : type, null);
+      return {namespace, ancestorInfo};
+    }
+    return getChildNamespace(null, type);
+  },
+
+  getChildHostContext(
+    parentHostContext : HostContext,
+    type : string,
+  ) : HostContext {
+    if (__DEV__) {
+      const parentHostContextDev = ((parentHostContext : any) : HostContextDev);
+      const namespace = getChildNamespace(parentHostContextDev.namespace, type);
+      const ancestorInfo = updatedAncestorInfo(parentHostContextDev.ancestorInfo, type, null);
+      return {namespace, ancestorInfo};
+    }
+    const parentNamespace = ((parentHostContext : any) : HostContextProd);
+    return getChildNamespace(parentNamespace, type);
+  },
+
+  prepareForCommit() : void {
+    eventsEnabled = ReactBrowserEventEmitter.isEnabled();
+    ReactBrowserEventEmitter.setEnabled(false);
+    selectionInformation = ReactInputSelection.getSelectionInformation();
+  },
+
+  resetAfterCommit() : void {
+    ReactInputSelection.restoreSelection(selectionInformation);
+    selectionInformation = null;
+    ReactBrowserEventEmitter.setEnabled(eventsEnabled);
+    eventsEnabled = null;
   },
 
   createInstance(
     type : string,
     props : Props,
-    children : HostChildren<Instance | TextInstance>,
-    internalInstanceHandle : Object
+    rootContainerInstance : Container,
+    hostContext : HostContext,
+    internalInstanceHandle : Object,
   ) : Instance {
-    const root = document.body; // HACK
-
-    const domElement : Instance = createElement(type, props, root);
+    let parentNamespace : string;
+    if (__DEV__) {
+      // TODO: take namespace into account when validating.
+      const hostContextDev = ((hostContext : any) : HostContextDev);
+      validateDOMNesting(type, null, null, hostContextDev.ancestorInfo);
+      if (
+        typeof props.children === 'string' ||
+        typeof props.children === 'number'
+      ) {
+        const ownAncestorInfo = updatedAncestorInfo(hostContextDev.ancestorInfo, type, null);
+        validateDOMNesting(null, String(props.children), null, ownAncestorInfo);
+      }
+      parentNamespace = hostContextDev.namespace;
+    } else {
+      parentNamespace = ((hostContext : any) : HostContextProd);
+    }
+    const domElement : Instance = createElement(type, props, rootContainerInstance, parentNamespace);
     precacheFiberNode(internalInstanceHandle, domElement);
-    recursivelyAppendChildren(domElement, children);
-    setInitialProperties(domElement, type, props, root);
     return domElement;
+  },
+
+  appendInitialChild(parentInstance : Instance, child : Instance | TextInstance) : void {
+    parentInstance.appendChild(child);
+  },
+
+  finalizeInitialChildren(
+    domElement : Instance,
+    type : string,
+    props : Props,
+    rootContainerInstance : Container,
+  ) : void {
+    setInitialProperties(domElement, type, props, rootContainerInstance);
   },
 
   prepareUpdate(
     domElement : Instance,
+    type : string,
     oldProps : Props,
-    newProps : Props
+    newProps : Props,
+    hostContext : HostContext,
   ) : boolean {
+    if (__DEV__) {
+      const hostContextDev = ((hostContext : any) : HostContextDev);
+      if (typeof newProps.children !== typeof oldProps.children && (
+        typeof newProps.children === 'string' ||
+        typeof newProps.children === 'number'
+      )) {
+        const ownAncestorInfo = updatedAncestorInfo(hostContextDev.ancestorInfo, type, null);
+        validateDOMNesting(null, String(newProps.children), null, ownAncestorInfo);
+      }
+    }
     return true;
   },
 
   commitUpdate(
     domElement : Instance,
+    type : string,
     oldProps : Props,
     newProps : Props,
-    internalInstanceHandle : Object
+    rootContainerInstance : Container,
+    internalInstanceHandle : Object,
   ) : void {
-    var type = domElement.tagName.toLowerCase(); // HACK
-    var root = document.body; // HACK
     // Update the internal instance handle so that we know which props are
     // the current ones.
     precacheFiberNode(internalInstanceHandle, domElement);
-    updateProperties(domElement, type, oldProps, newProps, root);
+    updateProperties(domElement, type, oldProps, newProps, rootContainerInstance);
   },
 
-  createTextInstance(text : string, internalInstanceHandle : Object) : TextInstance {
+  shouldSetTextContent(props : Props) : boolean {
+    return (
+      typeof props.children === 'string' ||
+      typeof props.children === 'number' ||
+      (
+        typeof props.dangerouslySetInnerHTML === 'object' &&
+        props.dangerouslySetInnerHTML !== null &&
+        typeof props.dangerouslySetInnerHTML.__html === 'string'
+      )
+    );
+  },
+
+  resetTextContent(domElement : Instance) : void {
+    domElement.textContent = '';
+  },
+
+  createTextInstance(
+    text : string,
+    rootContainerInstance : Container,
+    hostContext : HostContext,
+    internalInstanceHandle : Object
+  ) : TextInstance {
+    if (__DEV__) {
+      const hostContextDev = ((hostContext : any) : HostContextDev);
+      validateDOMNesting(null, text, null, hostContextDev.ancestorInfo);
+    }
     var textNode : TextInstance = document.createTextNode(text);
     precacheFiberNode(internalInstanceHandle, textNode);
     return textNode;
@@ -128,19 +221,19 @@ var DOMRenderer = ReactFiberReconciler({
     textInstance.nodeValue = newText;
   },
 
-  appendChild(parentInstance : Instance, child : Instance | TextInstance) : void {
+  appendChild(parentInstance : Instance | Container, child : Instance | TextInstance) : void {
     parentInstance.appendChild(child);
   },
 
   insertBefore(
-    parentInstance : Instance,
+    parentInstance : Instance | Container,
     child : Instance | TextInstance,
     beforeChild : Instance | TextInstance
   ) : void {
     parentInstance.insertBefore(child, beforeChild);
   },
 
-  removeChild(parentInstance : Instance, child : Instance | TextInstance) : void {
+  removeChild(parentInstance : Instance | Container, child : Instance | TextInstance) : void {
     parentInstance.removeChild(child);
   },
 
@@ -151,6 +244,8 @@ var DOMRenderer = ReactFiberReconciler({
   useSyncScheduling: true,
 
 });
+
+ReactGenericBatching.injection.injectFiberBatchedUpdates(DOMRenderer.batchedUpdates);
 
 var warned = false;
 
@@ -164,9 +259,15 @@ function warnAboutUnstableUse() {
   warned = true;
 }
 
-function renderSubtreeIntoContainer(parentComponent : ?ReactComponent<any, any, any>, element : ReactElement<any>, container : DOMContainerElement, callback: ?Function) {
+function renderSubtreeIntoContainer(parentComponent : ?ReactComponent<any, any, any>, element : ReactElement<any>, containerNode : DOMContainerElement | Document, callback: ?Function) {
+  let container : DOMContainerElement =
+    containerNode.nodeType === DOCUMENT_NODE ? (containerNode : any).documentElement : (containerNode : any);
   let root;
   if (!container._reactRootContainer) {
+    // First clear any existing content.
+    while (container.lastChild) {
+      container.removeChild(container.lastChild);
+    }
     root = container._reactRootContainer = DOMRenderer.mountContainer(element, container, parentComponent, callback);
   } else {
     DOMRenderer.updateContainer(element, root = container._reactRootContainer, parentComponent, callback);
@@ -181,12 +282,12 @@ var ReactDOM = {
     return renderSubtreeIntoContainer(null, element, container, callback);
   },
 
-  unstable_renderSubtreeIntoContainer(parentComponent : ReactComponent<any, any, any>, element : ReactElement<any>, container : DOMContainerElement, callback: ?Function) {
+  unstable_renderSubtreeIntoContainer(parentComponent : ReactComponent<any, any, any>, element : ReactElement<any>, containerNode : DOMContainerElement | Document, callback: ?Function) {
     invariant(
       parentComponent != null && ReactInstanceMap.has(parentComponent),
       'parentComponent must be a valid React Component'
     );
-    return renderSubtreeIntoContainer(parentComponent, element, container, callback);
+    return renderSubtreeIntoContainer(parentComponent, element, containerNode, callback);
   },
 
   unmountComponentAtNode(container : DOMContainerElement) {
@@ -207,9 +308,9 @@ var ReactDOM = {
     return ReactPortal.createPortal(children, container, null, key);
   },
 
-  unstable_batchedUpdates<A>(fn : () => A) : A {
-    return DOMRenderer.batchedUpdates(fn);
-  },
+  unstable_batchedUpdates: ReactGenericBatching.batchedUpdates,
+
+  unstable_deferredUpdates: DOMRenderer.deferredUpdates,
 
 };
 

@@ -12,6 +12,8 @@
 
 'use strict';
 
+import type { ReactElement, Source } from 'ReactElementType';
+import type { ReactInstance, DebugID } from 'ReactInstanceType';
 import type { ReactFragment } from 'ReactTypes';
 import type { ReactCoroutine, ReactYield } from 'ReactCoroutine';
 import type { ReactPortal } from 'ReactPortal';
@@ -24,13 +26,13 @@ var ReactTypeOfWork = require('ReactTypeOfWork');
 var {
   IndeterminateComponent,
   ClassComponent,
-  HostContainer,
+  HostRoot,
   HostComponent,
   HostText,
+  HostPortal,
   CoroutineComponent,
   YieldComponent,
   Fragment,
-  Portal,
 } = ReactTypeOfWork;
 
 var {
@@ -41,9 +43,20 @@ var {
   NoEffect,
 } = require('ReactTypeOfSideEffect');
 
+var {
+  cloneUpdateQueue,
+} = require('ReactFiberUpdateQueue');
+
+var invariant = require('invariant');
+
 // A Fiber is work on a Component that needs to be done or was done. There can
 // be more than one per component.
 export type Fiber = {
+  // __DEV__ only
+  _debugID ?: DebugID,
+  _debugSource ?: Source | null,
+  _debugOwner ?: Fiber | ReactInstance | null, // Stack compatible
+
   // These first fields are conceptually members of an Instance. This used to
   // be split into a separate type and intersected with the other Fiber fields,
   // but until Flow fixes its intersection bugs, we've merged them into a
@@ -91,15 +104,13 @@ export type Fiber = {
   pendingProps: any, // This type will be more specific once we overload the tag.
   // TODO: I think that there is a way to merge pendingProps and memoizedProps.
   memoizedProps: any, // The props used to create the output.
-  // A queue of local state updates.
-  updateQueue: ?UpdateQueue,
-  // The state used to create the output. This is a full state object.
+
+  // A queue of state updates and callbacks.
+  updateQueue: UpdateQueue | null,
+  // A list of callbacks that should be called during the next commit.
+  callbackList: UpdateQueue | null,
+  // The state used to create the output
   memoizedState: any,
-  // Linked list of callbacks to call after updates are committed.
-  callbackList: ?UpdateQueue,
-  // Output is the return value of this fiber, or a linked list of return values
-  // if this returns multiple values. Such as a fragment.
-  output: any, // This type will be more specific once we overload the tag.
 
   // Effect
   effectTag: TypeOfSideEffect,
@@ -146,7 +157,7 @@ export type Fiber = {
 };
 
 if (__DEV__) {
-  var debugCounter = 0;
+  var debugCounter = 1;
 }
 
 // This is a constructor of a POJO instead of a constructor function for a few
@@ -163,7 +174,7 @@ if (__DEV__) {
 // 5) It should be easy to port this to a C struct and keep a C implementation
 //    compatible.
 var createFiber = function(tag : TypeOfWork, key : null | string) : Fiber {
-  var fiber = {
+  var fiber : Fiber = {
 
     // Instance
 
@@ -188,9 +199,8 @@ var createFiber = function(tag : TypeOfWork, key : null | string) : Fiber {
     pendingProps: null,
     memoizedProps: null,
     updateQueue: null,
-    memoizedState: null,
     callbackList: null,
-    output: null,
+    memoizedState: null,
 
     effectTag: NoEffect,
     nextEffect: null,
@@ -206,9 +216,13 @@ var createFiber = function(tag : TypeOfWork, key : null | string) : Fiber {
     alternate: null,
 
   };
+
   if (__DEV__) {
-    (fiber : any)._debugID = debugCounter++;
+    fiber._debugID = debugCounter++;
+    fiber._debugSource = null;
+    fiber._debugOwner = null;
   }
+
   return fiber;
 };
 
@@ -261,27 +275,36 @@ exports.cloneFiber = function(fiber : Fiber, priorityLevel : PriorityLevel) : Fi
   // pendingProps is here for symmetry but is unnecessary in practice for now.
   // TODO: Pass in the new pendingProps as an argument maybe?
   alt.pendingProps = fiber.pendingProps;
-  alt.updateQueue = fiber.updateQueue;
-  alt.callbackList = fiber.callbackList;
+  cloneUpdateQueue(alt, fiber);
   alt.pendingWorkPriority = priorityLevel;
 
   alt.memoizedProps = fiber.memoizedProps;
   alt.memoizedState = fiber.memoizedState;
-  alt.output = fiber.output;
+
+  if (__DEV__) {
+    alt._debugID = fiber._debugID;
+    alt._debugSource = fiber._debugSource;
+    alt._debugOwner = fiber._debugOwner;
+  }
 
   return alt;
 };
 
-exports.createHostContainerFiber = function() : Fiber {
-  const fiber = createFiber(HostContainer, null);
+exports.createHostRootFiber = function() : Fiber {
+  const fiber = createFiber(HostRoot, null);
   return fiber;
 };
 
-exports.createFiberFromElement = function(element : ReactElement<*>, priorityLevel : PriorityLevel) : Fiber {
-// $FlowFixMe: ReactElement.key is currently defined as ?string but should be defined as null | string in Flow.
+exports.createFiberFromElement = function(element : ReactElement, priorityLevel : PriorityLevel) : Fiber {
   const fiber = createFiberFromElementType(element.type, element.key);
   fiber.pendingProps = element.props;
   fiber.pendingWorkPriority = priorityLevel;
+
+  if (__DEV__) {
+    fiber._debugSource = element._source;
+    fiber._debugOwner = element._owner;
+  }
+
   return fiber;
 };
 
@@ -320,7 +343,13 @@ function createFiberFromElementType(type : mixed, key : null | string) : Fiber {
     // There is probably a clever way to restructure this.
     fiber = ((type : any) : Fiber);
   } else {
-    throw new Error('Unknown component type: ' + typeof type);
+    invariant(
+      false,
+      'Element type is invalid: expected a string (for built-in components) ' +
+      'or a class/function (for composite components) but got: %s.',
+      type == null ? type : typeof type,
+      // TODO: Stack also includes owner name in the message.
+    );
   }
   return fiber;
 }
@@ -342,8 +371,8 @@ exports.createFiberFromYield = function(yieldNode : ReactYield, priorityLevel : 
 };
 
 exports.createFiberFromPortal = function(portal : ReactPortal, priorityLevel : PriorityLevel) : Fiber {
-  const fiber = createFiber(Portal, portal.key);
-  fiber.pendingProps = portal.children;
+  const fiber = createFiber(HostPortal, portal.key);
+  fiber.pendingProps = portal.children || [];
   fiber.pendingWorkPriority = priorityLevel;
   fiber.stateNode = {
     containerInfo: portal.containerInfo,

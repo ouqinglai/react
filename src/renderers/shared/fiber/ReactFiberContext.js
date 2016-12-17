@@ -22,6 +22,7 @@ var {
 } = require('ReactFiberTreeReflection');
 var {
   ClassComponent,
+  HostRoot,
 } = require('ReactTypeOfWork');
 
 if (__DEV__) {
@@ -39,8 +40,8 @@ function getUnmaskedContext() {
   return contextStack[index];
 }
 
-exports.getMaskedContext = function(fiber : Fiber) {
-  const type = fiber.type;
+exports.getMaskedContext = function(workInProgress : Fiber) {
+  const type = workInProgress.type;
   const contextTypes = type.contextTypes;
   if (!contextTypes) {
     return emptyObject;
@@ -53,9 +54,8 @@ exports.getMaskedContext = function(fiber : Fiber) {
   }
 
   if (__DEV__) {
-    const name = getComponentName(fiber);
-    const debugID = 0; // TODO: pass a real ID
-    checkReactTypeSpec(contextTypes, context, 'context', name, null, debugID);
+    const name = getComponentName(workInProgress);
+    checkReactTypeSpec(contextTypes, context, 'context', name, null, workInProgress);
   }
 
   return context;
@@ -68,16 +68,20 @@ exports.hasContextChanged = function() : boolean {
 function isContextProvider(fiber : Fiber) : boolean {
   return (
     fiber.tag === ClassComponent &&
+    // Instance might be null, if the fiber errored during construction
+    fiber.stateNode &&
     typeof fiber.stateNode.getChildContext === 'function'
   );
 }
 exports.isContextProvider = isContextProvider;
 
-exports.popContextProvider = function() : void {
+function popContextProvider() : void {
+  invariant(index > -1, 'Unexpected context pop');
   contextStack[index] = emptyObject;
   didPerformWorkStack[index] = false;
   index--;
-};
+}
+exports.popContextProvider = popContextProvider;
 
 exports.pushTopLevelContextObject = function(context : Object, didChange : boolean) : void {
   invariant(index === -1, 'Unexpected context found on stack');
@@ -86,7 +90,7 @@ exports.pushTopLevelContextObject = function(context : Object, didChange : boole
   didPerformWorkStack[index] = didChange;
 };
 
-function processChildContext(fiber : Fiber, parentContext : Object): Object {
+function processChildContext(fiber : Fiber, parentContext : Object, isReconciling : boolean): Object {
   const instance = fiber.stateNode;
   const childContextTypes = fiber.type.childContextTypes;
   const childContext = instance.getChildContext();
@@ -100,15 +104,20 @@ function processChildContext(fiber : Fiber, parentContext : Object): Object {
   }
   if (__DEV__) {
     const name = getComponentName(fiber);
-    const debugID = 0; // TODO: pass a real ID
-    checkReactTypeSpec(childContextTypes, childContext, 'childContext', name, null, debugID);
+    // We can only provide accurate element stacks if we pass work-in-progress tree
+    // during the begin or complete phase. However currently this function is also
+    // called from unstable_renderSubtree legacy implementation. In this case it unsafe to
+    // assume anything about the given fiber. We won't pass it down if we aren't sure.
+    // TODO: remove this hack when we delete unstable_renderSubtree in Fiber.
+    const workInProgress = isReconciling ? fiber : null;
+    checkReactTypeSpec(childContextTypes, childContext, 'childContext', name, null, workInProgress);
   }
   return {...parentContext, ...childContext};
 }
 exports.processChildContext = processChildContext;
 
-exports.pushContextProvider = function(fiber : Fiber, didPerformWork : boolean) : void {
-  const instance = fiber.stateNode;
+exports.pushContextProvider = function(workInProgress : Fiber, didPerformWork : boolean) : void {
+  const instance = workInProgress.stateNode;
   const memoizedMergedChildContext = instance.__reactInternalMemoizedMergedChildContext;
   const canReuseMergedChildContext = !didPerformWork && memoizedMergedChildContext != null;
 
@@ -116,7 +125,7 @@ exports.pushContextProvider = function(fiber : Fiber, didPerformWork : boolean) 
   if (canReuseMergedChildContext) {
     mergedContext = memoizedMergedChildContext;
   } else {
-    mergedContext = processChildContext(fiber, getUnmaskedContext());
+    mergedContext = processChildContext(workInProgress, getUnmaskedContext(), true);
     instance.__reactInternalMemoizedMergedChildContext = mergedContext;
   }
 
@@ -137,12 +146,24 @@ exports.findCurrentUnmaskedContext = function(fiber: Fiber) : Object {
     'Expected subtree parent to be a mounted class component'
   );
 
-  let node : ?Fiber = parent;
-  while (node) {
-    if (isContextProvider(fiber)) {
-      return fiber.stateNode.__reactInternalMemoizedMergedChildContext;
+  let node : Fiber = fiber;
+  while (node.tag !== HostRoot) {
+    if (isContextProvider(node)) {
+      return node.stateNode.__reactInternalMemoizedMergedChildContext;
+    }
+    const parent = node.return;
+    invariant(parent, 'Found unexpected detached subtree parent');
+    node = parent;
+  }
+  return node.stateNode.context;
+};
+
+exports.unwindContext = function(from : Fiber, to: Fiber) {
+  let node = from;
+  while (node && (node !== to) && (node.alternate !== to)) {
+    if (isContextProvider(node)) {
+      popContextProvider();
     }
     node = node.return;
   }
-  return emptyObject;
 };

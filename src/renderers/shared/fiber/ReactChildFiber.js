@@ -12,9 +12,11 @@
 
 'use strict';
 
+import type { ReactElement } from 'ReactElementType';
 import type { ReactCoroutine, ReactYield } from 'ReactCoroutine';
 import type { ReactPortal } from 'ReactPortal';
 import type { Fiber } from 'ReactFiber';
+import type { ReactInstance } from 'ReactInstanceType';
 import type { PriorityLevel } from 'ReactPriorityLevel';
 
 var REACT_ELEMENT_TYPE = require('ReactElementSymbol');
@@ -33,6 +35,12 @@ var ReactTypeOfWork = require('ReactTypeOfWork');
 
 var emptyObject = require('emptyObject');
 var getIteratorFn = require('getIteratorFn');
+var invariant = require('invariant');
+
+if (__DEV__) {
+  var { getCurrentFiberStackAddendum } = require('ReactDebugCurrentFiber');
+  var warning = require('warning');
+}
 
 const {
   cloneFiber,
@@ -54,10 +62,10 @@ const isArray = Array.isArray;
 const {
   ClassComponent,
   HostText,
+  HostPortal,
   CoroutineComponent,
   YieldComponent,
   Fragment,
-  Portal,
 } = ReactTypeOfWork;
 
 const {
@@ -66,25 +74,36 @@ const {
   Deletion,
 } = ReactTypeOfSideEffect;
 
-function coerceRef(current: ?Fiber, element: ReactElement<any>) {
+function coerceRef(current: ?Fiber, element: ReactElement) {
   let mixedRef = element.ref;
   if (mixedRef != null && typeof mixedRef !== 'function') {
     if (element._owner) {
-      const ownerFiber : ?Fiber = (element._owner : any);
-      if (ownerFiber && ownerFiber.tag === ClassComponent) {
-        const stringRef = String(mixedRef);
-        // Check if previous string ref matches new string ref
-        if (current && current.ref && current.ref._stringRef === stringRef) {
-          return current.ref;
+      const ownerFiber : ?(Fiber | ReactInstance) = (element._owner : any);
+      let inst;
+      if (ownerFiber) {
+        if ((ownerFiber : any).tag === ClassComponent) {
+          inst = (ownerFiber : any).stateNode;
+        } else {
+          // Stack
+          inst = (ownerFiber : any).getPublicInstance();
         }
-        const inst = ownerFiber.stateNode;
-        const ref = function(value) {
-          const refs = inst.refs === emptyObject ? (inst.refs = {}) : inst.refs;
-          refs[stringRef] = value;
-        };
-        ref._stringRef = stringRef;
-        return ref;
       }
+      invariant(inst, 'Missing owner for string ref %s', mixedRef);
+      const stringRef = String(mixedRef);
+      // Check if previous string ref matches new string ref
+      if (current && current.ref && current.ref._stringRef === stringRef) {
+        return current.ref;
+      }
+      const ref = function(value) {
+        const refs = inst.refs === emptyObject ? (inst.refs = {}) : inst.refs;
+        if (value === null) {
+          delete refs[stringRef];
+        } else {
+          refs[stringRef] = value;
+        }
+      };
+      ref._stringRef = stringRef;
+      return ref;
     }
   }
   return mixedRef;
@@ -243,7 +262,7 @@ function ChildReconciler(shouldClone, shouldTrackSideEffects) {
   function updateElement(
     returnFiber : Fiber,
     current : ?Fiber,
-    element : ReactElement<any>,
+    element : ReactElement,
     priority : PriorityLevel
   ) : Fiber {
     if (current == null || current.type !== element.type) {
@@ -258,6 +277,10 @@ function ChildReconciler(shouldClone, shouldTrackSideEffects) {
       existing.ref = coerceRef(current, element);
       existing.pendingProps = element.props;
       existing.return = returnFiber;
+      if (__DEV__) {
+        existing._debugSource = element._source;
+        existing._debugOwner = element._owner;
+      }
       return existing;
     }
   }
@@ -294,14 +317,14 @@ function ChildReconciler(shouldClone, shouldTrackSideEffects) {
       // Insert
       const reifiedYield = createReifiedYield(yieldNode);
       const created = createFiberFromYield(yieldNode, priority);
-      created.output = reifiedYield;
+      created.type = reifiedYield;
       created.return = returnFiber;
       return created;
     } else {
       // Move based on index
       const existing = useFiber(current, priority);
-      existing.output = createUpdatedReifiedYield(
-        current.output,
+      existing.type = createUpdatedReifiedYield(
+        current.type,
         yieldNode
       );
       existing.return = returnFiber;
@@ -317,7 +340,7 @@ function ChildReconciler(shouldClone, shouldTrackSideEffects) {
   ) : Fiber {
     if (
       current == null ||
-      current.tag !== Portal ||
+      current.tag !== HostPortal ||
       current.stateNode.containerInfo !== portal.containerInfo ||
       current.stateNode.implementation !== portal.implementation
     ) {
@@ -328,7 +351,7 @@ function ChildReconciler(shouldClone, shouldTrackSideEffects) {
     } else {
       // Update
       const existing = useFiber(current, priority);
-      existing.pendingProps = portal.children;
+      existing.pendingProps = portal.children || [];
       existing.return = returnFiber;
       return existing;
     }
@@ -386,7 +409,7 @@ function ChildReconciler(shouldClone, shouldTrackSideEffects) {
         case REACT_YIELD_TYPE: {
           const reifiedYield = createReifiedYield(newChild);
           const created = createFiberFromYield(newChild, priority);
-          created.output = reifiedYield;
+          created.type = reifiedYield;
           created.return = returnFiber;
           return created;
         }
@@ -523,6 +546,48 @@ function ChildReconciler(shouldClone, shouldTrackSideEffects) {
     return null;
   }
 
+  function warnOnDuplicateKey(
+    child : mixed,
+    knownKeys : Set<string> | null
+  ) : Set<string> | null {
+    if (__DEV__) {
+      if (typeof child !== 'object' || child == null) {
+        return knownKeys;
+      }
+      switch (child.$$typeof) {
+        case REACT_ELEMENT_TYPE:
+        case REACT_COROUTINE_TYPE:
+        case REACT_YIELD_TYPE:
+        case REACT_PORTAL_TYPE:
+          const key = child.key;
+          if (typeof key !== 'string') {
+            break;
+          }
+          if (knownKeys == null) {
+            knownKeys = new Set();
+            knownKeys.add(key);
+            break;
+          }
+          if (!knownKeys.has(key)) {
+            knownKeys.add(key);
+            break;
+          }
+          warning(
+            false,
+            'Encountered two children with the same key, ' +
+            '`%s`. Child keys must be unique; when two children share a key, ' +
+            'only the first child will be used.%s',
+            key,
+            getCurrentFiberStackAddendum()
+          );
+          break;
+        default:
+          break;
+      }
+    }
+    return knownKeys;
+  }
+
   function reconcileChildrenArray(
     returnFiber : Fiber,
     currentFirstChild : ?Fiber,
@@ -544,6 +609,18 @@ function ChildReconciler(shouldClone, shouldTrackSideEffects) {
 
     // In this first iteration, we'll just live with hitting the bad case
     // (adding everything to a Map) in for every insert/move.
+
+    // If you change this code, also update reconcileChildrenIterator() which
+    // uses the same algorithm.
+
+    if (__DEV__) {
+      // First, validate keys.
+      let knownKeys = null;
+      for (let i = 0; i < newChildren.length; i++) {
+        const child = newChildren[i];
+        knownKeys = warnOnDuplicateKey(child, knownKeys);
+      }
+    }
 
     let resultingFirstChild : ?Fiber = null;
     let previousNewFiber : ?Fiber = null;
@@ -675,11 +752,164 @@ function ChildReconciler(shouldClone, shouldTrackSideEffects) {
   function reconcileChildrenIterator(
     returnFiber : Fiber,
     currentFirstChild : ?Fiber,
-    newChildren : Iterator<*>,
-    priority : PriorityLevel) : null {
-    // TODO: Copy everything from reconcileChildrenArray but use the iterator
-    // instead.
-    return null;
+    newChildrenIterable : Iterable<*>,
+    priority : PriorityLevel) : ?Fiber {
+
+    // This is the same implementation as reconcileChildrenArray(),
+    // but using the iterator instead.
+
+    const iteratorFn = getIteratorFn(newChildrenIterable);
+    if (typeof iteratorFn !== 'function') {
+      throw new Error('An object is not an iterable.');
+    }
+
+    if (__DEV__) {
+      // First, validate keys.
+      // We'll get a different iterator later for the main pass.
+      const newChildren = iteratorFn.call(newChildrenIterable);
+      if (newChildren == null) {
+        throw new Error('An iterable object provided no iterator.');
+      }
+      let knownKeys = null;
+      let step = newChildren.next();
+      for (; !step.done; step = newChildren.next()) {
+        const child = step.value;
+        knownKeys = warnOnDuplicateKey(child, knownKeys);
+      }
+    }
+
+    const newChildren = iteratorFn.call(newChildrenIterable);
+    if (newChildren == null) {
+      throw new Error('An iterable object provided no iterator.');
+    }
+
+    let resultingFirstChild : ?Fiber = null;
+    let previousNewFiber : ?Fiber = null;
+
+    let oldFiber = currentFirstChild;
+    let lastPlacedIndex = 0;
+    let newIdx = 0;
+    let nextOldFiber = null;
+
+    let step = newChildren.next();
+    for (; oldFiber && !step.done; newIdx++, step = newChildren.next()) {
+      if (oldFiber) {
+        if (oldFiber.index > newIdx) {
+          nextOldFiber = oldFiber;
+          oldFiber = null;
+        } else {
+          nextOldFiber = oldFiber.sibling;
+        }
+      }
+      const newFiber = updateSlot(
+        returnFiber,
+        oldFiber,
+        step.value,
+        priority
+      );
+      if (!newFiber) {
+        // TODO: This breaks on empty slots like null children. That's
+        // unfortunate because it triggers the slow path all the time. We need
+        // a better way to communicate whether this was a miss or null,
+        // boolean, undefined, etc.
+        if (!oldFiber) {
+          oldFiber = nextOldFiber;
+        }
+        break;
+      }
+      if (shouldTrackSideEffects) {
+        if (oldFiber && !newFiber.alternate) {
+          // We matched the slot, but we didn't reuse the existing fiber, so we
+          // need to delete the existing child.
+          deleteChild(returnFiber, oldFiber);
+        }
+      }
+      lastPlacedIndex = placeChild(newFiber, lastPlacedIndex, newIdx);
+      if (!previousNewFiber) {
+        // TODO: Move out of the loop. This only happens for the first run.
+        resultingFirstChild = newFiber;
+      } else {
+        // TODO: Defer siblings if we're not at the right index for this slot.
+        // I.e. if we had null values before, then we want to defer this
+        // for each null value. However, we also don't want to call updateSlot
+        // with the previous one.
+        previousNewFiber.sibling = newFiber;
+      }
+      previousNewFiber = newFiber;
+      oldFiber = nextOldFiber;
+    }
+
+    if (step.done) {
+      // We've reached the end of the new children. We can delete the rest.
+      deleteRemainingChildren(returnFiber, oldFiber);
+      return resultingFirstChild;
+    }
+
+    if (!oldFiber) {
+      // If we don't have any more existing children we can choose a fast path
+      // since the rest will all be insertions.
+      for (; !step.done; newIdx++, step = newChildren.next()) {
+        const newFiber = createChild(
+          returnFiber,
+          step.value,
+          priority
+        );
+        if (!newFiber) {
+          continue;
+        }
+        lastPlacedIndex = placeChild(newFiber, lastPlacedIndex, newIdx);
+        if (!previousNewFiber) {
+          // TODO: Move out of the loop. This only happens for the first run.
+          resultingFirstChild = newFiber;
+        } else {
+          previousNewFiber.sibling = newFiber;
+        }
+        previousNewFiber = newFiber;
+      }
+      return resultingFirstChild;
+    }
+
+    // Add all children to a key map for quick lookups.
+    const existingChildren = mapRemainingChildren(returnFiber, oldFiber);
+
+    // Keep scanning and use the map to restore deleted items as moves.
+    for (; !step.done; newIdx++, step = newChildren.next()) {
+      const newFiber = updateFromMap(
+        existingChildren,
+        returnFiber,
+        newIdx,
+        step.value,
+        priority
+      );
+      if (newFiber) {
+        if (shouldTrackSideEffects) {
+          if (newFiber.alternate) {
+            // The new fiber is a work in progress, but if there exists a
+            // current, that means that we reused the fiber. We need to delete
+            // it from the child list so that we don't add it to the deletion
+            // list.
+            existingChildren.delete(
+              newFiber.key === null ? newIdx : newFiber.key
+            );
+          }
+        }
+        lastPlacedIndex = placeChild(newFiber, lastPlacedIndex, newIdx);
+        if (!previousNewFiber) {
+          resultingFirstChild = newFiber;
+        } else {
+          previousNewFiber.sibling = newFiber;
+        }
+        previousNewFiber = newFiber;
+      }
+    }
+
+    if (shouldTrackSideEffects) {
+      // Any existing children that weren't consumed above were deleted. We need
+      // to add them to the deletion list.
+      existingChildren.forEach(child => deleteChild(returnFiber, child));
+    }
+
+    return resultingFirstChild;
   }
 
   function reconcileSingleTextNode(
@@ -710,7 +940,7 @@ function ChildReconciler(shouldClone, shouldTrackSideEffects) {
   function reconcileSingleElement(
     returnFiber : Fiber,
     currentFirstChild : ?Fiber,
-    element : ReactElement<any>,
+    element : ReactElement,
     priority : PriorityLevel
   ) : Fiber {
     const key = element.key;
@@ -725,6 +955,10 @@ function ChildReconciler(shouldClone, shouldTrackSideEffects) {
           existing.ref = coerceRef(child, element);
           existing.pendingProps = element.props;
           existing.return = returnFiber;
+          if (__DEV__) {
+            existing._debugSource = element._source;
+            existing._debugOwner = element._owner;
+          }
           return existing;
         } else {
           deleteRemainingChildren(returnFiber, child);
@@ -790,8 +1024,8 @@ function ChildReconciler(shouldClone, shouldTrackSideEffects) {
         if (child.tag === YieldComponent) {
           deleteRemainingChildren(returnFiber, child.sibling);
           const existing = useFiber(child, priority);
-          existing.output = createUpdatedReifiedYield(
-            child.output,
+          existing.type = createUpdatedReifiedYield(
+            child.type,
             yieldNode
           );
           existing.return = returnFiber;
@@ -808,7 +1042,7 @@ function ChildReconciler(shouldClone, shouldTrackSideEffects) {
 
     const reifiedYield = createReifiedYield(yieldNode);
     const created = createFiberFromYield(yieldNode, priority);
-    created.output = reifiedYield;
+    created.type = reifiedYield;
     created.return = returnFiber;
     return created;
   }
@@ -826,13 +1060,13 @@ function ChildReconciler(shouldClone, shouldTrackSideEffects) {
       // the first item in the list.
       if (child.key === key) {
         if (
-          child.tag === Portal &&
+          child.tag === HostPortal &&
           child.stateNode.containerInfo === portal.containerInfo &&
           child.stateNode.implementation === portal.implementation
         ) {
           deleteRemainingChildren(returnFiber, child.sibling);
           const existing = useFiber(child, priority);
-          existing.pendingProps = portal.children;
+          existing.pendingProps = portal.children || [];
           existing.return = returnFiber;
           return existing;
         } else {
@@ -917,8 +1151,7 @@ function ChildReconciler(shouldClone, shouldTrackSideEffects) {
         );
       }
 
-      const iteratorFn = getIteratorFn(newChild);
-      if (iteratorFn) {
+      if (getIteratorFn(newChild)) {
         return reconcileChildrenIterator(
           returnFiber,
           currentFirstChild,
